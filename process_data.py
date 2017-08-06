@@ -1,7 +1,7 @@
 import numpy as np
 from elasticsearch import Elasticsearch
 from bs4 import BeautifulSoup
-import enchant, re, email
+import email
 from datetime import datetime
 
 class Label():
@@ -30,21 +30,28 @@ def processLabels():
             labels.append(Label(l, mail_name))
     return labels
 
-def loadMail(mail_name):
+def loadMail(mail_name, es, vocabulary = None):
     with open('../data/trec07p/data/' + mail_name, 'r') as f:
         mail = f.read().decode("ascii", errors = 'ignore')
     mail = email.message_from_string(mail)
     mail_content = ''
     # subject
     if 'Subject' in mail:
-        mail_content += removeNoneEnglish(mail['Subject'])
+        vocabulary = updateVocabulary(mail['Subject'], es, vocabulary)
+        mail_content += mail['Subject']
     if mail.is_multipart():
         pl_list = getAllPayLoads(mail)
         for part in pl_list:
-            mail_content += cleanText(part.get_payload())
+            conten_type = part.__getitem__('Content-Type')
+            if conten_type and conten_type[:4].lower() == 'text':
+                text, vocabulary = cleanText(part.get_payload(), es, vocabulary)
+                mail_content += text + ' '
     else:
-        mail_content += cleanText(mail.get_payload())
-    return mail_content
+        conten_type = mail.__getitem__('Content-Type')
+        if conten_type and conten_type.[:4].lower() == 'text':
+            text, vocabulary = cleanText(mail.get_payload(), es, vocabulary)
+            mail_content += text + ' '
+    return mail_content, vocabulary
 
 def getAllPayLoads(mail):
     pl, pl_list = [mail], []
@@ -56,23 +63,31 @@ def getAllPayLoads(mail):
             pl_list.append(p)
     return pl_list
 
-def removeNoneEnglish(text):
-    words = re.findall(r"\w+(?:\.\w+)*",text) #TOKENIZER.tokenize(text)
-    words = filter(lambda w: 25 > len(w) > 1 and
-                                (DICT.check(w.lower()) or DICT.check(w)
-                                    or (w.isdigit() and 0 < int(w) < 3000)),
-                            words)
-    return ' '.join(words) + '\n'
+def updateVocabulary(text, es, vocabulary = None):
+    if vocabulary is not None:
+        tokens = es.indices.analyze(index = 'spam',
+                                    body={"analyzer" : "my_english",
+                                            "text": text })['tokens']
+        if len(tokens) > 0:
+            words = map(lambda t: t['token'] , tokens)
+            words = filter(lambda w:
+                        (w.isdigit() and 1 < float(w) < 10000)
+                        or (w.replace('.', '').isalpha() and len(w) < 25)
+                        or (w.replace('_', '').isalpha() and len(w) < 25),
+                    words)
+            #print set(words) - vocabulary
+            vocabulary = vocabulary | set(words)
+    return vocabulary
 
-def cleanText(text):
+def cleanText(text, es, vocabulary = None):
     # print text
     soup = BeautifulSoup(text, "lxml")
     # kill all script and style elements
     for script in soup(["script", "style"]):
         script.decompose()
     text = ' '.join(soup.stripped_strings)
-    # remove non-English words
-    return removeNoneEnglish(text)
+    vocabulary = updateVocabulary(text, es, vocabulary)
+    return text, vocabulary
 
 def dumpES(cnt, mail, label, flag):
     es.index(index = 'spam',
@@ -83,10 +98,17 @@ def dumpES(cnt, mail, label, flag):
                     "label": label.label,
                     "is_train_set": flag})
 
-#TOKENIZER = RegexpTokenizer(r"\w+(?:\.\w+)*")
-DICT = enchant.Dict('en_US')
+def dumpVocabulary(vocabulary):
+    with open('../results/vocabulary.txt', 'w') as f:
+        for w in sorted(list(vocabulary)):
+            word = w.encode('ascii', 'ignore').decode('ascii')
+            if len(word) > 0:
+                f.write(word + '\n')
+    print 'size of vocabulary is', len(vocabulary)
 
 if __name__ == '__main__':
+    vocabulary = set()
+
     labels = processLabels()
     np.random.seed(512)
     np.random.shuffle(labels)
@@ -102,16 +124,18 @@ if __name__ == '__main__':
     print 'load train set'
     for i in xrange(train_length):
         #print labels[i].mail_name
-        mail = loadMail(labels[i].mail_name)
+        mail, vocabulary = loadMail(labels[i].mail_name, es, vocabulary)
         dumpES(i, mail, labels[i], 1)
-        if (i + 1)%5000 == 0:
+        if (i + 1) % 1000 == 0:
             print i + 1, 'documents'
+
+    dumpVocabulary(vocabulary)
 
     print 'load test set'
     for i in xrange(train_length, length):
         #print labels[i].mail_name
-        mail = loadMail(labels[i].mail_name)
+        mail = loadMail(labels[i].mail_name, es)
         dumpES(i, mail, labels[i], 0)
-        if (i + 1 - train_length) %5000 == 0:
+        if (i + 1 - train_length) % 1000 == 0:
             print i + 1 - train_length, 'documents'
     print 'running time', datetime.now() - now
