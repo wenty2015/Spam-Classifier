@@ -30,27 +30,49 @@ def processLabels():
             labels.append(Label(l, mail_name))
     return labels
 
+def processText(text):
+    return text.replace('_', ' _ ').replace('.', '. ')
+
+def loadSubject(mail):
+    mail_subject = ''
+    if 'Subject' in mail:
+        content = processText(mail['Subject'])
+        mail_subject += 'Subject: '+ content + '\n'
+    if 'From' in mail:
+        content = processText(mail['From'])
+        mail_subject += 'From: '+ content + '\n'
+    if 'To' in mail:
+        content = processText(mail['To'])
+        mail_subject += 'To: '+ content + '\n'
+    return mail_subject
+
 def loadMail(mail_name, es, vocabulary = None):
     with open('../data/trec07p/data/' + mail_name, 'r') as f:
         mail = f.read().decode("ascii", errors = 'ignore')
     mail = email.message_from_string(mail)
-    mail_content = ''
-    # subject
-    if 'Subject' in mail:
-        vocabulary = updateVocabulary(mail['Subject'], es, vocabulary)
-        mail_content += mail['Subject']
+
+    mail_content = loadSubject(mail)
+    if len(mail_content) > 0:
+        vocabulary = updateVocabulary(mail_content, es, vocabulary)
+
     if mail.is_multipart():
         pl_list = getAllPayLoads(mail)
         for part in pl_list:
             conten_type = part.__getitem__('Content-Type')
-            if conten_type and conten_type[:4].lower() == 'text':
-                text, vocabulary = cleanText(part.get_payload(), es, vocabulary)
-                mail_content += text + ' '
+            if conten_type:
+                mail_content += 'Content-Type: ' + conten_type + '\n'
+                if conten_type[:4].lower() == 'text':
+                    text = processText(part.get_payload())
+                    text, vocabulary = cleanText(text, es, vocabulary)
+                    mail_content += text + '\n'
     else:
         conten_type = mail.__getitem__('Content-Type')
-        if conten_type and conten_type.[:4].lower() == 'text':
-            text, vocabulary = cleanText(mail.get_payload(), es, vocabulary)
-            mail_content += text + ' '
+        if conten_type:
+            mail_content += 'Content-Type: ' + conten_type + '\n'
+            if conten_type[:4].lower() == 'text':
+                text = processText(mail.get_payload())
+                text, vocabulary = cleanText(text, es, vocabulary)
+                mail_content += text + '\n'
     return mail_content, vocabulary
 
 def getAllPayLoads(mail):
@@ -64,19 +86,29 @@ def getAllPayLoads(mail):
     return pl_list
 
 def updateVocabulary(text, es, vocabulary = None):
-    if vocabulary is not None:
+    if text != '' and vocabulary is not None:
         tokens = es.indices.analyze(index = 'spam',
                                     body={"analyzer" : "my_english",
                                             "text": text })['tokens']
         if len(tokens) > 0:
-            words = map(lambda t: t['token'] , tokens)
+            ori_tokens = es.indices.analyze(index = 'spam',
+                                            body={"analyzer" : "standard",
+                                                    "text": text })['tokens']
+            ori_words = {}
+            for t in ori_tokens:
+                ori_words[t['position']] = t['token']
+
+            words = map(lambda t: (t['token'], t['position']) , tokens)
             words = filter(lambda w:
-                        (w.isdigit() and 1 < float(w) < 10000)
-                        or (w.replace('.', '').isalpha() and len(w) < 25)
-                        or (w.replace('_', '').isalpha() and len(w) < 25),
+                        (w[0].isdigit() and 1 < float(w[0]) < 1000 and
+                            w[0][0] != '0')
+                        or (w[0].replace('.', '').isalpha() and len(w[0]) < 20)
+                        or (w[0].replace('_', '').isalpha() and len(w[0]) < 20),
                     words)
-            #print set(words) - vocabulary
-            vocabulary = vocabulary | set(words)
+            for w in words:
+                word, position = w
+                if word not in vocabulary:
+                    vocabulary[word] = ori_words[position]
     return vocabulary
 
 def cleanText(text, es, vocabulary = None):
@@ -86,6 +118,7 @@ def cleanText(text, es, vocabulary = None):
     for script in soup(["script", "style"]):
         script.decompose()
     text = ' '.join(soup.stripped_strings)
+    text = text.replace(' _', ' ').replace('_ ', ' ')
     vocabulary = updateVocabulary(text, es, vocabulary)
     return text, vocabulary
 
@@ -100,14 +133,16 @@ def dumpES(cnt, mail, label, flag):
 
 def dumpVocabulary(vocabulary):
     with open('../results/vocabulary.txt', 'w') as f:
-        for w in sorted(list(vocabulary)):
-            word = w.encode('ascii', 'ignore').decode('ascii')
-            if len(word) > 0:
-                f.write(word + '\n')
+        for w_stemmed in sorted(vocabulary.keys()):
+            w = vocabulary[w_stemmed]
+            word_stemmed = w_stemmed.encode('ascii', 'ignore').decode('ascii')
+            if len(word_stemmed) > 0:
+                word = w.encode('ascii', 'ignore').decode('ascii')
+                f.write(' '.join([word_stemmed, word]) + '\n')
     print 'size of vocabulary is', len(vocabulary)
 
 if __name__ == '__main__':
-    vocabulary = set()
+    vocabulary = {}
 
     labels = processLabels()
     np.random.seed(512)
@@ -125,17 +160,19 @@ if __name__ == '__main__':
     for i in xrange(train_length):
         #print labels[i].mail_name
         mail, vocabulary = loadMail(labels[i].mail_name, es, vocabulary)
-        dumpES(i, mail, labels[i], 1)
+        dumpES(i, mail.replace('%', ' percent ').replace('$', ' dollar '),
+                    labels[i], 1)
         if (i + 1) % 1000 == 0:
-            print i + 1, 'documents'
+            print i + 1, 'documents, size of vocabulary is', len(vocabulary)
 
     dumpVocabulary(vocabulary)
 
     print 'load test set'
     for i in xrange(train_length, length):
         #print labels[i].mail_name
-        mail = loadMail(labels[i].mail_name, es)
-        dumpES(i, mail, labels[i], 0)
+        mail, _ = loadMail(labels[i].mail_name, es)
+        dumpES(i, mail.replace('%', ' percent ').replace('$', ' dollar '),
+                    labels[i], 0)
         if (i + 1 - train_length) % 1000 == 0:
             print i + 1 - train_length, 'documents'
     print 'running time', datetime.now() - now
